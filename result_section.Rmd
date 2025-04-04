@@ -5,7 +5,6 @@ date: "2025-04-04"
 output: html_document
 ---
 
-
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 library(shiny)
@@ -13,26 +12,24 @@ library(tidyverse)
 library(lubridate)
 library(leaflet)
 library(ggplot2)
-#library(con2aqi)
-
+library(con2aqi)
 ```
+
 
 ```{r}
 # Import the CSV file
-dat <- read_csv("timeparsed_unclean_master_data.csv")
+dat <- read_csv("~/Documents/WEAct/weact/weact/camp_q2_data.csv")
 
 # Define the expected time format pattern: "YYYY-MM-DD HH:MM:SS"
 pattern <- "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$"
 
-# Filter rows where the 'time' column does NOT match the expected format using .data$time
+# Note: Update the column name if your CSV uses "time" instead of "time_stamp_parsed"
 bad_time_rows <- dat %>%
-  filter(!str_detect(.data$time_stamp_parsed, pattern))
+  filter(!str_detect(.data$time_stamp, pattern))
 
-# Count the number of rows with non-exact time format
+# Count and print the number of rows with non-exact time format
 bad_time_count <- nrow(bad_time_rows)
 cat("Number of rows with non-exact time format:", bad_time_count, "\n")
-
-# Print the rows that have a bad time format
 print(bad_time_rows)
 ```
 
@@ -83,27 +80,36 @@ write_csv(combined_data, "combined_cleaned_data.csv")
 ```
 
 ```{r}
-# Load the measurement data
-camp_q2_data <- read_csv("camp_q2_data.csv") %>%
+# ---------------------------
+# Global Data Loading
+# ---------------------------
+# Load merged data from individual CSV files
+merged_data <- {
+  camp_q2_data <- read_csv("camp_q2_data.csv") %>%
+    mutate(
+      time_stamp   = ymd_hms(time_stamp),
+      sensor_index = as.integer(sensor_index),
+      pm25_alt     = `pm2.5_alt`,
+      pm25_aqi     = `pm2.5_aqi`
+    )
+  sensor_info <- read_csv("sensorindex_name_latlong.csv") %>%
+    mutate(
+      sensor_index = as.integer(sensor_index),
+      height_ft    = `height (ft)`,
+      altitude_ft  = `altitude (ft)`
+    ) %>%
+    select(sensor_index, name_on_map, height_ft, altitude_ft, Latitude, Longitude)
+  
+  left_join(camp_q2_data, sensor_info, by = "sensor_index")
+}
+
+# Load the new combined, cleaned dataset
+cleaned_data <- read_csv("combined_cleaned_data.csv") %>%
   mutate(
-    time_stamp = ymd_hms(time_stamp),
-    sensor_index = as.integer(sensor_index),
-    # Use the PM2.5 and AQI columns directly
-    pm25_alt = `pm2.5_alt`,
-    pm25_aqi = `pm2.5_aqi`
+    time_stamp   = ymd_hms(time_stamp),
+    sensor_index = as.integer(sensor_index)
+    # If necessary, add additional mutations here to ensure the format matches
   )
-
-# Load the sensor info with latitude/longitude from the new file
-sensor_info <- read_csv("sensorindex_name_latlong.csv") %>%
-  mutate(
-    sensor_index = as.integer(sensor_index),
-    height_ft   = `height (ft)`,
-    altitude_ft = `altitude (ft)`
-  ) %>%
-  select(sensor_index, name_on_map, height_ft, altitude_ft, Latitude, Longitude)
-
-# Merge the two datasets on sensor_index
-combined_data <- left_join(camp_q2_data, sensor_info, by = "sensor_index")
 
 # ---------------------------
 # UI
@@ -112,17 +118,25 @@ ui <- fluidPage(
   titlePanel("Sensor PM2.5 and AQI Dashboard"),
   sidebarLayout(
     sidebarPanel(
+      # Data source selector: choose between merged and cleaned datasets
+      selectInput(
+        inputId = "data_source",
+        label   = "Select Data Source:",
+        choices = c("Merged Data", "Cleaned Data"),
+        selected = "Merged Data"
+      ),
+      # Sensor selection will update based on chosen data source
       selectInput(
         inputId = "sensor",
-        label = "Select Sensor:",
-        choices = c("All", sort(unique(sensor_info$name_on_map))),
+        label   = "Select Sensor:",
+        choices = NULL,  # Will be updated in the server
         selected = "All"
       ),
       dateRangeInput(
         inputId = "date_range",
-        label = "Select Date Range:",
-        start = min(as.Date(combined_data$time_stamp)),
-        end = max(as.Date(combined_data$time_stamp))
+        label   = "Select Date Range:",
+        start   = NULL,  # Will be updated in the server
+        end     = NULL
       )
     ),
     mainPanel(
@@ -139,11 +153,31 @@ ui <- fluidPage(
 # ---------------------------
 server <- function(input, output, session) {
   
+  # Reactive: Return the selected dataset
+  selected_data <- reactive({
+    if (input$data_source == "Merged Data") {
+      merged_data
+    } else {
+      cleaned_data
+    }
+  })
+  
+  # Update UI inputs (sensor list and date range) when the data source changes
+  observe({
+    data <- selected_data()
+    sensor_choices <- c("All", sort(unique(data$name_on_map)))
+    updateSelectInput(session, "sensor", choices = sensor_choices, selected = "All")
+    
+    updateDateRangeInput(session, "date_range",
+                         start = min(as.Date(data$time_stamp), na.rm = TRUE),
+                         end   = max(as.Date(data$time_stamp), na.rm = TRUE))
+  })
+  
   # Reactive: Filter data based on sensor selection and date range
   filtered_data <- reactive({
     req(input$date_range)
     
-    data <- combined_data %>%
+    data <- selected_data() %>%
       filter(as.Date(time_stamp) >= input$date_range[1],
              as.Date(time_stamp) <= input$date_range[2])
     
@@ -171,13 +205,14 @@ server <- function(input, output, session) {
     leaflet(summary_df) %>%
       addTiles() %>%
       addCircleMarkers(
-        lng = ~Longitude, lat = ~Latitude,
-        radius = ~avg_pm25,  # Marker size proportional to average PM2.5
-        color = "blue",
+        lng         = ~Longitude,
+        lat         = ~Latitude,
+        radius      = ~avg_pm25,  # Marker size proportional to average PM2.5
+        color       = "blue",
         fillOpacity = 0.7,
-        popup = ~paste0("<strong>", name_on_map, "</strong><br>",
-                        "Avg PM2.5: ", round(avg_pm25, 2), "<br>",
-                        "Avg AQI: ", round(avg_aqi, 2))
+        popup       = ~paste0("<strong>", name_on_map, "</strong><br>",
+                              "Avg PM2.5: ", round(avg_pm25, 2), "<br>",
+                              "Avg AQI: ", round(avg_aqi, 2))
       )
   })
   
@@ -187,18 +222,20 @@ server <- function(input, output, session) {
       ggplot(aes(x = time_stamp, y = pm25_aqi, color = name_on_map)) +
       geom_line() +
       labs(
-        title = "AQI Changes Over Time",
-        x = "Time",
-        y = "AQI",
-        color = "Sensor"
+        title  = "AQI Changes Over Time",
+        x      = "Time",
+        y      = "AQI",
+        color  = "Sensor"
       ) +
       theme_minimal()
   })
 }
 
 # ---------------------------
-# Run the Shiny App
+# Run the Shiny App if in interactive mode
 # ---------------------------
-shinyApp(ui = ui, server = server)
+if (interactive()) {
+  shinyApp(ui = ui, server = server)
+}
 ```
 
